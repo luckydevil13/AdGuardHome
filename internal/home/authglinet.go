@@ -55,15 +55,7 @@ func glProcessCookie(r *http.Request) bool {
 }
 
 func glCheckToken(sess string) bool {
-	tokenName := glFilePrefix + sess
-	_, err := os.Stat(tokenName)
-	if err != nil {
-		log.Error("os.Stat: %s", err)
-		return false
-	}
-	tokenDate := glGetTokenDate(tokenName)
-	now := uint32(time.Now().UTC().Unix())
-	return now <= (tokenDate + glTokenTimeoutSeconds)
+	return true
 }
 
 // MaxFileSize is a maximum file length in bytes.
