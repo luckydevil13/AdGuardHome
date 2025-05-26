@@ -35,7 +35,7 @@ NPM_FLAGS = --prefix $(CLIENT_DIR)
 NPM_INSTALL_FLAGS = $(NPM_FLAGS) --quiet --no-progress
 RACE = 0
 REVISION = $${REVISION:-$$(git rev-parse --short HEAD)}
-SIGN = 1
+SIGN = 0
 SIGNER_API_KEY = not-a-real-key
 VERSION = v0.0.0
 

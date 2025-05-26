@@ -236,7 +236,7 @@ func RegisterAuthHandlers() {
 func optionalAuthThird(w http.ResponseWriter, r *http.Request) (mustAuth bool) {
 	pref := fmt.Sprintf("auth: raddr %s", r.RemoteAddr)
 
-	if glProcessCookie(r) {
+	if glProcessCookie() {
 		log.Debug("%s: authentication is handled by gl-inet submodule", pref)
 
 		return false

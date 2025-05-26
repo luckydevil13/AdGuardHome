@@ -3,7 +3,6 @@
 package ipset
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -13,221 +12,83 @@ import (
 
 	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/logutil/slogutil"
-	"github.com/digineo/go-ipset/v2"
-	"github.com/mdlayher/netlink"
-	"github.com/ti-mo/netfilter"
-	"golang.org/x/sys/unix"
+	"github.com/google/nftables"
 )
 
 // How to test on a real Linux machine:
 //
-//  1. Run "sudo ipset create example_set hash:ip family ipv4".
+//  1. Create nftables set: "nft add table inet fw4; nft add set inet fw4 example_set { type ipv4_addr; }"
 //
-//  2. Run "sudo ipset list example_set".  The Members field should be empty.
+//  2. Run "nft list set inet fw4 example_set". The set should be empty.
 //
-//  3. Add the line "example.com/example_set" to your AdGuardHome.yaml.
+//  3. Add the line "example.com/4#inet#fw4#example_set" to your AdGuardHome.yaml.
 //
 //  4. Start AdGuardHome.
 //
 //  5. Make requests to example.com and its subdomains.
 //
-//  6. Run "sudo ipset list example_set".  The Members field should contain the
-//     resolved IP addresses.
+//  6. Run "nft list set inet fw4 example_set". The set should contain the resolved IP addresses.
 
-// newManager returns a new Linux ipset manager.
+// newManager returns a new Linux nftables ipset manager.
 func newManager(ctx context.Context, conf *Config) (set Manager, err error) {
-	return newManagerWithDialer(ctx, conf, defaultDial)
-}
+	defer func() { err = errors.Annotate(err, "ipset: %w") }()
 
-// defaultDial is the default netfilter dialing function.
-func defaultDial(pf netfilter.ProtoFamily, conf *netlink.Config) (conn ipsetConn, err error) {
-	c, err := ipset.Dial(pf, conf)
+	// Создаем соединение с nftables
+	c, err := nftables.New(nftables.AsLasting())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("creating nftables connection: %w", err)
 	}
 
-	return &queryConn{c}, nil
-}
+	m := &manager{
+		mu: &sync.Mutex{},
 
-// queryConn is the [ipsetConn] implementation with listAll method, which
-// returns the list of properties of all available ipsets.
-type queryConn struct {
-	*ipset.Conn
-}
+		nameToIpset:    make(map[string]*nftables.Set),
+		domainToIpsets: make(map[string][]*nftables.Set),
 
-// type check
-var _ ipsetConn = (*queryConn)(nil)
+		logger: conf.Logger,
+		conn:   c,
 
-// listAll returns the list of properties of all available ipsets.
-//
-// TODO(s.chzhen):  Use https://github.com/vishvananda/netlink.
-func (qc *queryConn) listAll() (sets []props, err error) {
-	msg, err := netfilter.MarshalNetlink(
-		netfilter.Header{
-			// The family doesn't seem to matter.  See TODO on parseIpsetConfig.
-			Family:      qc.Conn.Family,
-			SubsystemID: netfilter.NFSubsysIPSet,
-			MessageType: netfilter.MessageType(ipset.CmdList),
-			Flags:       netlink.Request | netlink.Dump,
-		},
-		[]netfilter.Attribute{{
-			Type: uint16(ipset.AttrProtocol),
-			Data: []byte{ipset.Protocol},
-		}},
-	)
+		addedIPs: container.NewMapSet[ipInIpsetEntry](),
+	}
+
+	err = m.parseIpsetConfig(ctx, conf.Lines)
 	if err != nil {
-		return nil, fmt.Errorf("marshaling netlink msg: %w", err)
+		return nil, fmt.Errorf("parsing ipset config: %w", err)
 	}
 
-	// We assume it's OK to call a method of an unexported type
-	// [ipset.connector], since there is no negative effects.
-	ms, err := qc.Conn.Conn.Query(msg)
-	if err != nil {
-		return nil, fmt.Errorf("querying netlink msg: %w", err)
-	}
+	m.logger.DebugContext(ctx, "nftables ipset manager initialized")
 
-	for i, s := range ms {
-		p := props{}
-		err = p.unmarshalMessage(s)
-		if err != nil {
-			return nil, fmt.Errorf("unmarshaling netlink msg at index %d: %w", i, err)
-		}
-
-		sets = append(sets, p)
-	}
-
-	return sets, nil
+	return m, nil
 }
 
-// ipsetConn is the ipset conn interface.
-type ipsetConn interface {
-	Add(name string, entries ...*ipset.Entry) (err error)
-	Close() (err error)
-	Header(name string) (p *ipset.HeaderPolicy, err error)
-	listAll() (sets []props, err error)
-}
-
-// dialer creates an ipsetConn.
-type dialer func(pf netfilter.ProtoFamily, conf *netlink.Config) (conn ipsetConn, err error)
-
-// props contains one Linux Netfilter ipset properties.
-type props struct {
-	// name of the ipset.
-	name string
-
-	// typeName of the ipset.
-	typeName string
-
-	// family of the IP addresses in the ipset.
-	family netfilter.ProtoFamily
-
-	// isPersistent indicates that ipset has no timeout parameter and all
-	// entries are added permanently.
-	isPersistent bool
-}
-
-// unmarshalMessage unmarshals netlink message and sets the properties of the
-// ipset.
-func (p *props) unmarshalMessage(msg netlink.Message) (err error) {
-	_, attrs, err := netfilter.UnmarshalNetlink(msg)
-	if err != nil {
-		// Don't wrap the error since it's informative enough as is.
-		return err
-	}
-
-	// By default ipset has no timeout parameter.
-	p.isPersistent = true
-
-	for _, a := range attrs {
-		p.parseAttribute(a)
-	}
-
-	return nil
-}
-
-// parseAttribute parses netfilter attribute and sets the name and family of
-// the ipset.
-func (p *props) parseAttribute(a netfilter.Attribute) {
-	switch ipset.AttributeType(a.Type) {
-	case ipset.AttrData:
-		p.parseAttrData(a)
-	case ipset.AttrSetName:
-		// Trim the null character.
-		p.name = string(bytes.Trim(a.Data, "\x00"))
-	case ipset.AttrTypeName:
-		p.typeName = string(bytes.Trim(a.Data, "\x00"))
-	case ipset.AttrFamily:
-		p.family = netfilter.ProtoFamily(a.Data[0])
-	default:
-		// Go on.
-	}
-}
-
-// parseAttrData parses attribute data and sets the timeout of the ipset.
-func (p *props) parseAttrData(a netfilter.Attribute) {
-	for _, a := range a.Children {
-		switch ipset.AttributeType(a.Type) {
-		case ipset.AttrTimeout:
-			timeout := a.Uint32()
-			p.isPersistent = timeout == 0
-		default:
-			// Go on.
-		}
-	}
-}
-
-// manager is the Linux Netfilter ipset manager.
+// manager is the Linux nftables ipset manager.
 type manager struct {
-	nameToIpset    map[string]props
-	domainToIpsets map[string][]props
+	// nameToIpset maps ipset names in format "4#inet#table#set" to nftables.Set
+	nameToIpset    map[string]*nftables.Set
+	// domainToIpsets maps domain names to their corresponding nftables sets
+	domainToIpsets map[string][]*nftables.Set
 
 	logger *slog.Logger
+	conn   *nftables.Conn
 
-	dial dialer
-
-	// mu protects all properties below.
+	// mu protects all properties below
 	mu *sync.Mutex
 
-	// TODO(a.garipov): Currently, the ipset list is static, and we don't read
-	// the IPs already in sets, so we can assume that all incoming IPs are
-	// either added to all corresponding ipsets or not.  When that stops being
-	// the case, for example if we add dynamic reconfiguration of ipsets, this
-	// map will need to become a per-ipset-name one.
+	// addedIPs tracks which IPs have been added to prevent duplicates
+	// Only persistent sets (without timeout) are tracked
 	addedIPs *container.MapSet[ipInIpsetEntry]
-
-	ipv4Conn ipsetConn
-	ipv6Conn ipsetConn
 }
 
-// ipInIpsetEntry is the type for entries in [manager.addIPs].
+// ipInIpsetEntry represents an IP address entry in a specific ipset
 type ipInIpsetEntry struct {
 	ipsetName string
-	// TODO(schzen):  Use netip.Addr.
+	// TODO(schzen): Use netip.Addr
 	ipArr [net.IPv6len]byte
 }
 
-// dialNetfilter establishes connections to Linux's netfilter module.
-func (m *manager) dialNetfilter(conf *netlink.Config) (err error) {
-	// The kernel API does not actually require two sockets but package
-	// github.com/digineo/go-ipset does.
-	//
-	// TODO(a.garipov): Perhaps we can ditch package ipset altogether and just
-	// use packages netfilter and netlink.
-	m.ipv4Conn, err = m.dial(netfilter.ProtoIPv4, conf)
-	if err != nil {
-		return fmt.Errorf("dialing v4: %w", err)
-	}
-
-	m.ipv6Conn, err = m.dial(netfilter.ProtoIPv6, conf)
-	if err != nil {
-		return fmt.Errorf("dialing v6: %w", err)
-	}
-
-	return nil
-}
-
 // parseIpsetConfigLine parses one ipset configuration line.
+// Format: "domain1,domain2/4#inet#table#set1,4#inet#table#set2"
+// Only IPv4 sets are supported (prefix "4#")
 func parseIpsetConfigLine(confStr string) (hosts, ipsetNames []string, err error) {
 	confStr = strings.TrimSpace(confStr)
 	hostsAndNames := strings.Split(confStr, "/")
@@ -242,6 +103,7 @@ func parseIpsetConfigLine(confStr string) (hosts, ipsetNames []string, err error
 		return nil, nil, nil
 	}
 
+	// Валидация и очистка имен ipset
 	for i := range ipsetNames {
 		ipsetNames[i] = strings.TrimSpace(ipsetNames[i])
 		if len(ipsetNames[i]) == 0 {
@@ -249,6 +111,7 @@ func parseIpsetConfigLine(confStr string) (hosts, ipsetNames []string, err error
 		}
 	}
 
+	// Валидация и очистка доменов
 	for i := range hosts {
 		hosts[i] = strings.ToLower(strings.TrimSpace(hosts[i]))
 	}
@@ -256,37 +119,69 @@ func parseIpsetConfigLine(confStr string) (hosts, ipsetNames []string, err error
 	return hosts, ipsetNames, nil
 }
 
-// parseIpsetConfig parses the ipset configuration and stores ipsets.  It
-// returns an error if the configuration can't be used.
+// parseIpsetConfig parses the ipset configuration and stores nftables sets.
 func (m *manager) parseIpsetConfig(ctx context.Context, ipsetConf []string) (err error) {
-	// The family doesn't seem to matter when we use a header query, so query
-	// only the IPv4 one.
-	//
-	// TODO(a.garipov): Find out if this is a bug or a feature.
-	all, err := m.ipv4Conn.listAll()
-	if err != nil {
-		// Don't wrap the error since it's informative enough as is.
-		return err
-	}
-
-	currentlyKnown := map[string]props{}
-	for _, p := range all {
-		currentlyKnown[p.name] = p
-	}
-
 	for i, confStr := range ipsetConf {
 		var hosts, ipsetNames []string
 		hosts, ipsetNames, err = parseIpsetConfigLine(confStr)
 		if err != nil {
-			return fmt.Errorf("config line at idx %d: %w", i, err)
+			return fmt.Errorf("config line at idx %d(%s): %w", i, confStr, err)
 		}
 
-		var ipsets []props
-		ipsets, err = m.ipsets(ctx, ipsetNames, currentlyKnown)
-		if err != nil {
-			return fmt.Errorf("getting ipsets from config line at idx %d: %w", i, err)
+		var ipsets []*nftables.Set
+		for _, n := range ipsetNames {
+			// Парсим формат "4#inet#table#set"
+			parts := strings.Split(n, "#")
+			if len(parts) != 4 {
+				return fmt.Errorf("parsing ipsets from config line at idx %d(l=%s,n=%s): wrong format, expected 4#inet#table#set", i, confStr, n)
+			}
+
+			// Проверяем, что это IPv4 set
+			if parts[0] != "4" {
+				return fmt.Errorf("parsing ipsets from config line at idx %d(l=%s,n=%s): only IPv4 sets supported (4#...)", i, confStr, n)
+			}
+
+			// Проверяем семейство таблицы
+			if parts[1] != "inet" {
+				return fmt.Errorf("parsing ipsets from config line at idx %d(l=%s,n=%s): only inet family supported", i, confStr, n)
+			}
+
+			tableName := parts[2]
+			setName := parts[3]
+
+			// Проверяем кэш
+			set, ok := m.nameToIpset[n]
+			if !ok {
+				// Получаем set из nftables
+				tbl := &nftables.Table{
+					Family: nftables.TableFamilyINet,
+					Name:   tableName,
+				}
+
+				set, err = m.conn.GetSetByName(tbl, setName)
+				if err != nil {
+					return fmt.Errorf("getting ipset from config line at idx %d(l=%s,n=%s): %w", i, confStr, n, err)
+				}
+
+				// Проверяем тип set - должен быть IPv4
+				if set.KeyType != nftables.TypeIPAddr {
+					return fmt.Errorf("got ipset from config line at idx %d(l=%s,n=%s): wrong type, expected ipv4_addr", i, confStr, n)
+				}
+
+				m.nameToIpset[n] = set
+				m.logger.DebugContext(ctx, "loaded nftables set",
+					"config_line", confStr,
+					"hosts", hosts,
+					"set_name", n,
+					"table", tableName,
+					"set", setName,
+				)
+			}
+
+			ipsets = append(ipsets, set)
 		}
 
+		// Связываем домены с sets
 		for _, host := range hosts {
 			m.domainToIpsets[host] = append(m.domainToIpsets[host], ipsets...)
 		}
@@ -295,125 +190,11 @@ func (m *manager) parseIpsetConfig(ctx context.Context, ipsetConf []string) (err
 	return nil
 }
 
-// ipsetProps returns the properties of an ipset with the given name.
-//
-// Additional header data query.  See https://github.com/AdguardTeam/AdGuardHome/issues/6420.
-//
-// TODO(s.chzhen):  Use *props.
-func (m *manager) ipsetProps(name string) (p props, err error) {
-	// The family doesn't seem to matter when we use a header query, so
-	// query only the IPv4 one.
-	//
-	// TODO(a.garipov): Find out if this is a bug or a feature.
-	var res *ipset.HeaderPolicy
-	res, err = m.ipv4Conn.Header(name)
-	if err != nil {
-		return props{}, err
-	}
-
-	if res == nil || res.Family == nil {
-		return props{}, errors.Error("empty response or no family data")
-	}
-
-	family := netfilter.ProtoFamily(res.Family.Value)
-	if family != netfilter.ProtoIPv4 && family != netfilter.ProtoIPv6 {
-		return props{}, fmt.Errorf("unexpected ipset family %q", family)
-	}
-
-	typeName := res.TypeName.Get()
-
-	return props{
-		name:         name,
-		typeName:     typeName,
-		family:       family,
-		isPersistent: false,
-	}, nil
-}
-
-// ipsets returns ipset properties of currently known ipsets.  It also makes an
-// additional ipset header data query if needed.
-func (m *manager) ipsets(
-	ctx context.Context,
-	names []string,
-	currentlyKnown map[string]props,
-) (sets []props, err error) {
-	for _, n := range names {
-		p, ok := currentlyKnown[n]
-		if !ok {
-			return nil, fmt.Errorf("unknown ipset %q", n)
-		}
-
-		if p.family != netfilter.ProtoIPv4 && p.family != netfilter.ProtoIPv6 {
-			m.logger.DebugContext(
-				ctx,
-				"got unexpected ipset family while getting set properties",
-				"set_name", p.name,
-				"set_type", p.typeName,
-				"set_family", p.family,
-			)
-
-			p, err = m.ipsetProps(n)
-			if err != nil {
-				return nil, fmt.Errorf("%q %q making header query: %w", p.name, p.typeName, err)
-			}
-		}
-
-		m.nameToIpset[n] = p
-		sets = append(sets, p)
-	}
-
-	return sets, nil
-}
-
-// newManagerWithDialer returns a new Linux ipset manager using the provided
-// dialer.
-func newManagerWithDialer(ctx context.Context, conf *Config, dial dialer) (mgr Manager, err error) {
-	defer func() { err = errors.Annotate(err, "ipset: %w") }()
-
-	m := &manager{
-		mu: &sync.Mutex{},
-
-		nameToIpset:    make(map[string]props),
-		domainToIpsets: make(map[string][]props),
-
-		logger: conf.Logger,
-
-		dial: dial,
-
-		addedIPs: container.NewMapSet[ipInIpsetEntry](),
-	}
-
-	err = m.dialNetfilter(&netlink.Config{})
-	if err != nil {
-		if errors.Is(err, unix.EPROTONOSUPPORT) {
-			// The implementation doesn't support this protocol version.  Just
-			// issue a warning.
-			m.logger.WarnContext(ctx, "dialing netfilter", slogutil.KeyError, err)
-
-			return nil, nil
-		}
-
-		return nil, fmt.Errorf("dialing netfilter: %w", err)
-	}
-
-	err = m.parseIpsetConfig(ctx, conf.Lines)
-	if err != nil {
-		return nil, fmt.Errorf("getting ipsets: %w", err)
-	}
-
-	m.logger.DebugContext(ctx, "initialized")
-
-	return m, nil
-}
-
-// lookupHost find the ipsets for the host, taking subdomain wildcards into
-// account.
-func (m *manager) lookupHost(host string) (sets []props) {
-	// Search for matching ipset hosts starting with most specific domain.
-	// We could use a trie here but the simple, inefficient solution isn't
-	// that expensive: ~10 ns for TLD + SLD vs. ~140 ns for 10 subdomains on
-	// an AMD Ryzen 7 PRO 4750U CPU; ~120 ns vs. ~ 1500 ns on a Raspberry
-	// Pi's ARMv7 rev 4 CPU.
+// lookupHost finds the nftables sets for the host, taking subdomain wildcards into account.
+func (m *manager) lookupHost(host string) (sets []*nftables.Set) {
+	// Поиск подходящих ipset начиная с наиболее специфичного домена
+	// Можно использовать trie, но простое решение достаточно эффективно:
+	// ~10 ns для TLD + SLD vs. ~140 ns для 10 поддоменов на AMD Ryzen 7 PRO 4750U
 	for i := 0; ; i++ {
 		host = host[i:]
 		sets = m.domainToIpsets[host]
@@ -427,58 +208,66 @@ func (m *manager) lookupHost(host string) (sets []props) {
 		}
 	}
 
-	// Check the root catch-all one.
+	// Проверяем корневой catch-all
 	return m.domainToIpsets[""]
 }
 
-// addIPs adds the IP addresses for the host to the ipset.  set must be same
-// family as set's family.
-func (m *manager) addIPs(host string, set props, ips []net.IP) (n int, err error) {
+// addIPs adds IPv4 addresses to the nftables set.
+func (m *manager) addIPs(host string, set *nftables.Set, ips []net.IP) (n int, err error) {
 	if len(ips) == 0 {
 		return 0, nil
 	}
 
-	var entries []*ipset.Entry
+	var elements []nftables.SetElement
 	var newAddedEntries []ipInIpsetEntry
+
 	for _, ip := range ips {
+		// Создаем ключ для отслеживания добавленных IP
 		e := ipInIpsetEntry{
-			ipsetName: set.name,
+			ipsetName: fmt.Sprintf("4#inet#%s#%s", set.Table.Name, set.Name),
 		}
 		copy(e.ipArr[:], ip.To16())
 
+		// Пропускаем уже добавленные IP
 		if m.addedIPs.Has(e) {
 			continue
 		}
 
-		entries = append(entries, ipset.NewEntry(ipset.EntryIP(ip)))
+		// Создаем элемент для добавления в set
+		// Для IPv4 используем To4()
+		ipv4 := ip.To4()
+		if ipv4 == nil {
+			continue // Пропускаем не-IPv4 адреса
+		}
+
+		elements = append(elements, nftables.SetElement{
+			Key: []byte(ipv4),
+		})
 		newAddedEntries = append(newAddedEntries, e)
 	}
 
-	n = len(entries)
+	n = len(elements)
 	if n == 0 {
 		return 0, nil
 	}
 
-	var conn ipsetConn
-	switch set.family {
-	case netfilter.ProtoIPv4:
-		conn = m.ipv4Conn
-	case netfilter.ProtoIPv6:
-		conn = m.ipv6Conn
-	default:
-		return 0, fmt.Errorf("unexpected family %s for ipset %q", set.family, set.name)
-	}
-
-	err = conn.Add(set.name, entries...)
+	// Добавляем элементы в set
+	err = m.conn.SetAddElements(set, elements)
 	if err != nil {
-		return 0, fmt.Errorf("adding %q%s to %q %q: %w", host, ips, set.name, set.typeName, err)
+		return 0, fmt.Errorf("adding %q%v to set %q: %w", host, ips, set.Name, err)
 	}
 
-	// Only add these to the cache once we're sure that all of them were
-	// actually sent to the ipset.
+	// Применяем изменения
+	err = m.conn.Flush()
+	if err != nil {
+		return 0, fmt.Errorf("flushing changes for %q%v to set %q: %w", host, ips, set.Name, err)
+	}
+
+	// Добавляем в кэш только после успешного добавления
+	// Только для persistent sets (без timeout)
 	for _, e := range newAddedEntries {
-		s := m.nameToIpset[e.ipsetName]
-		if s.isPersistent {
+		set := m.nameToIpset[e.ipsetName]
+		if !set.HasTimeout {
 			m.addedIPs.Add(e)
 		}
 	}
@@ -486,37 +275,40 @@ func (m *manager) addIPs(host string, set props, ips []net.IP) (n int, err error
 	return n, nil
 }
 
-// addToSets adds the IP addresses to the corresponding ipset.
+// addToSets adds IP addresses to the corresponding nftables sets.
 func (m *manager) addToSets(
 	ctx context.Context,
 	host string,
 	ip4s []net.IP,
 	ip6s []net.IP,
-	sets []props,
+	sets []*nftables.Set,
 ) (n int, err error) {
 	for _, set := range sets {
 		var nn int
-		switch set.family {
-		case netfilter.ProtoIPv4:
+
+		// Поддерживаем только IPv4 sets
+		switch set.KeyType {
+		case nftables.TypeIPAddr:
 			nn, err = m.addIPs(host, set, ip4s)
 			if err != nil {
 				return n, err
 			}
-		case netfilter.ProtoIPv6:
-			nn, err = m.addIPs(host, set, ip6s)
-			if err != nil {
-				return n, err
-			}
+		case nftables.TypeIP6Addr:
+			// IPv6 не поддерживается в этой версии
+			m.logger.DebugContext(ctx, "skipping IPv6 set (not supported)",
+				"set_name", set.Name,
+				"set_type", set.KeyType,
+			)
+			continue
 		default:
-			return n, fmt.Errorf("%q %q unexpected family %q", set.name, set.typeName, set.family)
+			return n, fmt.Errorf("set %q has unexpected type %q", set.Name, set.KeyType)
 		}
 
-		m.logger.DebugContext(
-			ctx,
-			"added ips to set",
-			"ips_num", nn,
-			"set_name", set.name,
-			"set_type", set.typeName,
+		m.logger.DebugContext(ctx, "added ips to nftables set",
+			"ips_added", nn,
+			"ip4s", ip4s,
+			"set_name", set.Name,
+			"set_type", set.KeyType,
 		)
 
 		n += nn
@@ -535,7 +327,10 @@ func (m *manager) Add(ctx context.Context, host string, ip4s, ip6s []net.IP) (n 
 		return 0, nil
 	}
 
-	m.logger.DebugContext(ctx, "found sets", "set_num", len(sets))
+	m.logger.DebugContext(ctx, "found nftables sets for host",
+		"host", host,
+		"sets_count", len(sets),
+	)
 
 	return m.addToSets(ctx, host, ip4s, ip6s, sets)
 }
@@ -545,19 +340,11 @@ func (m *manager) Close() (err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var errs []error
-
-	// Close both and collect errors so that the errors from closing one
-	// don't interfere with closing the other.
-	err = m.ipv4Conn.Close()
+	// Закрываем соединение с nftables
+	err = m.conn.CloseLasting()
 	if err != nil {
-		errs = append(errs, err)
+		return errors.Annotate(err, "closing nftables connection: %w")
 	}
 
-	err = m.ipv6Conn.Close()
-	if err != nil {
-		errs = append(errs, err)
-	}
-
-	return errors.Annotate(errors.Join(errs...), "closing ipsets: %w")
+	return nil
 }

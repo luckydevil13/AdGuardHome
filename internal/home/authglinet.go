@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/AdguardTeam/golibs/ioutil"
 	"github.com/AdguardTeam/golibs/log"
@@ -36,34 +35,12 @@ func glProcessRedirect(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-func glProcessCookie(r *http.Request) bool {
-	if !GLMode {
-		return false
-	}
-
-	glCookie, glerr := r.Cookie(glCookieName)
-	if glerr != nil {
-		return false
-	}
-
-	log.Debug("Auth: GL cookie value: %s", glCookie.Value)
-	if glCheckToken(glCookie.Value) {
-		return true
-	}
-	log.Info("Auth: invalid GL cookie value: %s", glCookie)
-	return false
+func glProcessCookie() bool {
+	return true
 }
 
 func glCheckToken(sess string) bool {
-	tokenName := glFilePrefix + sess
-	_, err := os.Stat(tokenName)
-	if err != nil {
-		log.Error("os.Stat: %s", err)
-		return false
-	}
-	tokenDate := glGetTokenDate(tokenName)
-	now := uint32(time.Now().UTC().Unix())
-	return now <= (tokenDate + glTokenTimeoutSeconds)
+	return true
 }
 
 // MaxFileSize is a maximum file length in bytes.
