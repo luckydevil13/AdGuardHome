@@ -2,6 +2,9 @@ Auth disabled
 ngtables ipset
 
 
+
+npm --prefix client run build-prod
+
 go clean -r
 go mod tidy
 set GO_ENABLED=0
